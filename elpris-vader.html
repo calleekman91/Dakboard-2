@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Elpris och väder</title>
+<style>
+  :root{
+    --bg:#000;
+    --ink:#f4f4f4;
+    --dim:rgba(244,244,244,.45);
+    --dimmer:rgba(244,244,244,.22);
+    --ref:#ff5b5b;
+    --sunrise:#ffd166;
+    --sunset:#8ab4f8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg);color:var(--ink);
+    font-family:"Inter","Helvetica Neue",Helvetica,Arial,sans-serif;
+    font-variant-numeric:tabular-nums;
+    display:flex;flex-direction:column;
+    padding:1.2vh 1vw;overflow:hidden;
+  }
+  #msg{flex:0 0 auto;text-align:center;font-size:1.8vh;color:var(--dim)}
+  #chart{flex:1 1 auto;min-height:0;width:100%}
+  #chart svg{width:100%;height:100%;display:block}
+  #wx{--wxfs:13px;flex:0 0 auto;display:flex;margin-top:.4vh}
+  #wxLab{flex:0 0 auto;text-align:right;color:var(--ink)}
+  #wxGrid{flex:1 1 auto;display:grid;text-align:center}
+  #wx div{line-height:1.35;white-space:nowrap}
+  #wxGrid > div{color:var(--ink);border-radius:3px}
+  .ic{font-size:calc(var(--wxfs) * 1.55);opacity:.8}
+  .tp{font-size:calc(var(--wxfs) * 1.25);font-weight:600}
+  .fl{font-size:calc(var(--wxfs) * 0.95);opacity:.4}
+  .sc{font-size:var(--wxfs);opacity:.65}
+</style>
+</head>
+<body>
+  <div id="msg">Hämtar data…</div>
+  <div id="chart"></div>
+  <div id="wx"><div id="wxLab"></div><div id="wxGrid"></div></div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---- inställningar ----------------------------------------------------
+  const ZONE = "SE3";          // SE1 Luleå · SE2 Sundsvall · SE3 Stockholm · SE4 Malmö
+  const LAT  = 59.31;          // Nacka
+  const LON  = 18.17;
+  const VAT  = 1;              // sätt 1.25 för att visa pris inkl. moms
+  const SURCHARGE = 0;         // öre/kWh påslag från elhandlaren, t.ex. 8
+  // Färgskalan är absolut, inte relativ till fönstret: allt under PRICE_LOW är
+  // helgrönt, allt över PRICE_HIGH helrött. Jämförs mot priset som visas,
+  // alltså efter VAT och SURCHARGE.
+  const PRICE_LOW  = 0.30;
+  const PRICE_HIGH = 1.20;
+  const WIN_H   = 24;          // fönstrets längd i timmar, från nuvarande kvart
+  const WX_STEP = 2;           // sifferraden visar var WX_STEP:e timme
+  // ----------------------------------------------------------------------
+
+  const MS_PRICE = 15 * 60 * 1000;
+  const MS_WX    = 20 * 60 * 1000;
+  const MS_DRAW  = 30 * 1000;
+  const HOUR     = 3600 * 1000;
+
+  let today = null, tomorrow = null, wx = null;
+  let padL = 0, padR = 0, padPitch = 0, padFirstX = 0, wxCols = [];
+
+  const pad2 = n => String(n).padStart(2, "0");
+  const hhmm = d => pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  const kr = v => (v * VAT + SURCHARGE / 100);
+  const sv = (v, d = 2) => v.toFixed(d).replace(".", ",");
+  const midnight = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+
+  const col = k => {
+    const f = Math.min(1, Math.max(0, (k - PRICE_LOW) / ((PRICE_HIGH - PRICE_LOW) || 1)));
+    return `hsl(${(142 * (1 - f)).toFixed(0)} 74% 56%)`;
+  };
+
+  function icon(code, night) {
+    if (code === 0) return night ? "🌙" : "☀️";
+    if (code <= 2)  return night ? "🌙" : "🌤";
+    if (code === 3) return "☁️";
+    if (code <= 48) return "🌫";
+    if (code <= 57) return "🌦";
+    if (code <= 67) return "🌧";
+    if (code <= 77) return "🌨";
+    if (code <= 82) return "🌧";
+    if (code <= 86) return "🌨";
+    return "⛈";
+  }
+
+  function sunIcon(x, y, s, c) {
+    let o = `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(s * 0.5).toFixed(1)}" fill="${c}"/>`;
+    for (let i = 0; i < 8; i++) {
+      const a = i * Math.PI / 4;
+      o += `<line x1="${(x + Math.cos(a) * s * 0.78).toFixed(1)}" y1="${(y + Math.sin(a) * s * 0.78).toFixed(1)}" x2="${(x + Math.cos(a) * s * 1.2).toFixed(1)}" y2="${(y + Math.sin(a) * s * 1.2).toFixed(1)}" stroke="${c}" stroke-width="${(s * 0.22).toFixed(2)}" stroke-linecap="round"/>`;
+    }
+    return o;
+  }
+
+  function moonIcon(x, y, s, c) {
+    const r = s * 0.98;
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" fill="${c}"/>`
+      + `<circle cx="${(x + r * 0.52).toFixed(1)}" cy="${(y - r * 0.12).toFixed(1)}" r="${(r * 0.84).toFixed(1)}" fill="var(--bg)"/>`;
+  }
+
+  function uvColor(u) {
+    if (u >= 8) return "#E24B4A";
+    if (u >= 6) return "#F0782C";
+    if (u >= 3) return "#EF9F27";
+    return null;
+  }
+
+  function feelsLabel(i) {
+    if (!wx.feels || wx.feels[i] === null || wx.feels[i] === undefined) return "&nbsp;";
+    const t = Math.round(wx.temp[i]), f = Math.round(wx.feels[i]);
+    return Math.abs(f - t) >= 1 ? `≈${f}°` : "&nbsp;";
+  }
+
+  // Är den absoluta timmen i mörker? Timmar 0–23 hör till idag, 24–47 till imorgon.
+  function isNight(i) {
+    if (!wx || !wx.rise) return false;
+    const d = wx.rise.length > 1 && i >= 24 ? 1 : 0;
+    const t = midnight() + i * HOUR;
+    return t < wx.rise[d].getTime() || t >= wx.set[d].getTime();
+  }
+
+  function alignWeather() {
+    const w = document.getElementById("chart").clientWidth;
+    if (!w || !padPitch || !wxCols.length) return;
+    const pitch2 = padPitch * WX_STEP;
+    const n = wxCols.length;
+    document.getElementById("wxLab").style.width =
+      Math.max(0, padFirstX - pitch2 / 2).toFixed(1) + "px";
+    document.getElementById("wxLab").style.paddingRight = (padPitch * 0.22).toFixed(1) + "px";
+    const grid = document.getElementById("wxGrid");
+    grid.style.gridTemplateColumns = `repeat(${n},1fr)`;
+    grid.style.paddingRight =
+      Math.max(0, w - padFirstX - pitch2 * (n - 0.5)).toFixed(1) + "px";
+    const fit = pitch2 * 0.9 / (3 * 0.58);
+    document.getElementById("wx").style.setProperty("--wxfs",
+      Math.max(7, Math.min(fit, 18)).toFixed(1) + "px");
+  }
+
+  // Kvartstexten ska börja vid samma vänsterkant som prissiffran. Prisets bredd
+  // beror på siffran, så kanten mäts fram i stället för att räknas ut.
+  function alignSlot(container) {
+    try {
+      const price = container.querySelector("#curPrice");
+      const slotEl = container.querySelector("#curSlot");
+      const bb = price.getBBox();
+      if (!bb.width) return;
+      slotEl.setAttribute("x", bb.x.toFixed(1));
+      slotEl.setAttribute("text-anchor", "start");
+    } catch (e) { /* getBBox saknas – behåll centrerat */ }
+  }
+
+  function draw() {
+    if (!today) return;
+    const box = document.getElementById("chart");
+    const W = Math.max(520, Math.round(box.clientWidth || 1000));
+    const H = Math.max(180, Math.round(box.clientHeight || 420));
+
+    const fs = +(H * 0.042).toFixed(0);
+    const pf = Math.round(fs * 2.5);
+    const qf = Math.round(fs * 0.95);
+    const wBox = Math.max("0,00 kr".length * pf * 0.55, "00:00–00:15".length * qf * 0.55) + fs * 1.2;
+    const half = Math.round(wBox / 2) + 14;
+    const L = Math.max(74, Math.round(fs * 4.6), half);
+    const R = Math.max(18, half);
+    const T = Math.round(fs * 5.2);
+    const iconR = Math.max(4, fs * 0.55);
+    const B = Math.round(fs * 3.9);
+
+    // Fönstret börjar vid den kvart som pågår nu och sträcker sig WIN_H timmar framåt.
+    const t0 = Math.floor(Date.now() / (15 * 60 * 1000)) * (15 * 60 * 1000);
+    const t1 = t0 + WIN_H * HOUR;
+
+    const series = (today || []).concat(tomorrow || [])
+      .map(p => ({ t: new Date(p.time_start).getTime(), v: kr(p.SEK_per_kWh), end: new Date(p.time_end).getTime() }))
+      .filter(p => p.end > t0 && p.t < t1)
+      .sort((a, b) => a.t - b.t);
+
+    if (!series.length) {
+      document.getElementById("msg").textContent = "Inga priser för perioden";
+      return;
+    }
+    document.getElementById("msg").textContent = "";
+
+    const v = series.map(p => p.v);
+    const lo = Math.min(...v), hi = Math.max(...v);
+
+    // Snitt, lägsta och högsta räknas per kalenderdygn på hela dygnets priser,
+    // inte på det rullande fönstret.
+    const vals = arr => arr && arr.length ? arr.map(p => kr(p.SEK_per_kWh)) : null;
+    const dayStat = arr => {
+      const a = vals(arr);
+      if (!a) return null;
+      return { lo: Math.min(...a), hi: Math.max(...a), avg: a.reduce((x, y) => x + y, 0) / a.length };
+    };
+    const dToday = dayStat(today), dTom = dayStat(tomorrow);
+    const avgToday = dToday ? dToday.avg : null, avgTom = dTom ? dTom.avg : null;
+
+    const spread = [lo, hi]
+      .concat(dToday ? [dToday.lo, dToday.hi] : [])
+      .concat(dTom ? [dTom.lo, dTom.hi] : [])
+      .filter(x => x !== null);
+    const y0 = Math.floor(Math.min(...spread) * 10) / 10;
+    const yTop = Math.ceil(Math.max(...spread) * 10) / 10;
+    const y1 = (yTop - y0 < 0.2) ? y0 + 0.2 : yTop;
+
+    // hOff = timmar från fönstrets början
+    const xAt = hOff => L + hOff * (W - L - R) / WIN_H;
+    const xOf = t => xAt((t - t0) / HOUR);
+    const Y = k => H - B - (k - y0) / (y1 - y0) * (H - T - B);
+
+    let g = "";
+
+    // Dygnets lägsta och högsta pris: idag till vänster, imorgon till höger.
+    if (dToday) for (const k of [dToday.lo, dToday.hi]) {
+      g += `<text x="${L - 10}" y="${(Y(k) + fs * 0.36).toFixed(1)}" fill="rgba(244,244,244,.45)" font-size="${fs}" text-anchor="end">${sv(k)}</text>`;
+    }
+    if (dTom) for (const k of [dTom.lo, dTom.hi]) {
+      g += `<text x="${W - R + 10}" y="${(Y(k) + fs * 0.36).toFixed(1)}" fill="rgba(244,244,244,.45)" font-size="${fs}" text-anchor="start">${sv(k)}</text>`;
+    }
+
+    // dygnsskiftet delar fönstret i dagens och morgondagens snitt
+    const nextMidnight = midnight() + 24 * HOUR;
+    const xMid = Math.min(Math.max(xOf(nextMidnight), L), W - R);
+    if (nextMidnight > t0 && nextMidnight < t1) {
+      g += `<line x1="${xMid.toFixed(1)}" y1="${T}" x2="${xMid.toFixed(1)}" y2="${H - B}" stroke="#8a8a8a" stroke-width="${Math.max(3, fs * 0.22).toFixed(1)}" stroke-opacity=".55" stroke-linecap="round"/>`;
+    }
+
+    // Ett snitt per kalenderdygn: dagens etikett i vänstermarginalen, morgondagens
+    // i högermarginalen, varje linje bara över sin egen del av fönstret.
+    const bh = Math.round(fs * 1.55);
+    const avgMark = (val, xa, xb, c, side) => {
+      if (val === null || xb - xa < 2) return "";
+      const y = Y(val), lbl = sv(val);
+      const bw = Math.round(lbl.length * fs * 0.58 + fs * 0.7);
+      const bx = side === "left" ? L - 7 - bw : W - R + 7;
+      const cx0 = side === "left" ? bx + bw : W - R;
+      const cx1 = side === "left" ? L : bx;
+      return `<line x1="${xa.toFixed(1)}" y1="${y.toFixed(1)}" x2="${xb.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${c}" stroke-width="1.5" stroke-dasharray="7 6" stroke-opacity=".9"/>`
+        + `<line x1="${cx0.toFixed(1)}" y1="${y.toFixed(1)}" x2="${cx1.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${c}" stroke-width="1.5"/>`
+        + `<rect x="${bx.toFixed(1)}" y="${(y - bh / 2).toFixed(1)}" width="${bw}" height="${bh}" rx="3" fill="#000" stroke="${c}" stroke-width="1.3"/>`
+        + `<text x="${(bx + bw / 2).toFixed(1)}" y="${(y + fs * 0.36).toFixed(1)}" fill="#f4f4f4" font-size="${fs}" text-anchor="middle">${lbl}</text>`;
+    };
+    g += avgMark(avgToday, L, xMid, "var(--ref)", "left");
+    g += avgMark(avgTom, xMid, W - R, "var(--sunset)", "right");
+
+    // priskurvan, ett färgat segment per intervall
+    for (let i = 0; i < series.length - 1; i++) {
+      g += `<line x1="${xOf(series[i].t).toFixed(1)}" y1="${Y(series[i].v).toFixed(1)}" x2="${xOf(series[i + 1].t).toFixed(1)}" y2="${Y(series[i + 1].v).toFixed(1)}" stroke="${col((series[i].v + series[i + 1].v) / 2)}" stroke-width="3" stroke-linecap="round"/>`;
+    }
+
+    // timetiketter och väderkolumner: hela klockslag inne i fönstret
+    const firstHour = Math.ceil(t0 / HOUR) * HOUR;
+    const hourTicks = [];
+    for (let t = firstHour; t < t1; t += HOUR) hourTicks.push(t);
+
+    const yIcon = H - B + Math.round(fs * 0.85) * 1.15 + iconR * 1.1;
+    padL = L; padR = R; padPitch = (W - L - R) / WIN_H;
+    wxCols = [];
+    for (const t of hourTicks) {
+      const d = new Date(t);
+      if (d.getHours() % WX_STEP) continue;
+      if (!wxCols.length) padFirstX = xOf(t);
+      wxCols.push(Math.round((t - midnight()) / HOUR));
+      g += `<text x="${xOf(t).toFixed(1)}" y="${(H - fs * 0.35).toFixed(1)}" fill="rgba(244,244,244,.42)" font-size="${(fs * 1.5).toFixed(0)}" text-anchor="middle">${pad2(d.getHours())}</text>`;
+    }
+
+    // sol- och måntecken för de tillfällen som ligger inne i fönstret
+    if (wx && wx.rise) {
+      const tf = Math.round(fs * 0.85);
+      const marks = [];
+      for (let d = 0; d < wx.rise.length; d++) {
+        marks.push([wx.rise[d], "var(--sunrise)", "sun"]);
+        marks.push([wx.set[d], "var(--sunset)", "moon"]);
+      }
+      for (const [d, c, kind] of marks) {
+        const t = d.getTime();
+        if (t < t0 || t > t1) continue;
+        const x = xOf(t);
+        g += `<text x="${x.toFixed(1)}" y="${(H - B + tf * 0.95).toFixed(1)}" fill="${c}" font-size="${tf}" text-anchor="middle" fill-opacity=".8">${hhmm(d)}</text>`;
+        g += kind === "sun" ? sunIcon(x, yIcon, iconR, c) : moonIcon(x, yIcon, iconR, c);
+      }
+    }
+
+    // Aktuellt pris centrerat högst upp, utan ram och utan lodrätt streck.
+    const cur = series[0];
+    const slot = `${hhmm(new Date(cur.t))}–${hhmm(new Date(cur.end))}`;
+    const cx = (L + (W - R)) / 2;
+    g += `<text id="curPrice" x="${cx.toFixed(1)}" y="${(T - fs * 2.6).toFixed(1)}" fill="${col(cur.v)}" font-size="${pf}" font-weight="600" text-anchor="middle">${sv(cur.v)}<tspan font-size="${Math.round(pf * 0.42)}" fill-opacity=".75"> kr</tspan></text>`;
+    g += `<text id="curSlot" x="${cx.toFixed(1)}" y="${(T - fs * 0.8).toFixed(1)}" fill="rgba(244,244,244,.5)" font-size="${qf}" text-anchor="middle">${slot}</text>`;
+
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`;
+    alignSlot(box);
+    drawWeather();
+  }
+
+  function drawWeather() {
+    if (!wx || !wxCols.length) return;
+    let html = "";
+    for (const i of wxCols) {
+      if (wx.temp[i] === undefined) { html += "<div></div>"; continue; }
+      const u = Math.round(wx.uv[i]);
+      const c = uvColor(u);
+      html += `<div${c ? ` style="color:${c};background:${c}1c"` : ""}>
+        <div class="ic">${icon(wx.code[i], isNight(i))}</div>
+        <div class="tp">${Math.round(wx.temp[i])}°</div>
+        <div class="fl">${feelsLabel(i)}</div>
+        <div class="sc">${wx.rain[i]}</div>
+        <div class="sc">${Math.round(wx.wind[i])}</div>
+        <div class="sc">${u}</div>
+      </div>`;
+    }
+    document.getElementById("wxGrid").innerHTML = html;
+    document.getElementById("wxLab").innerHTML =
+      `<div class="ic">&nbsp;</div>
+       <div class="tp">°C</div>
+       <div class="fl">känns</div>
+       <div class="sc">%</div>
+       <div class="sc">m/s</div>
+       <div class="sc">UV</div>`;
+    alignWeather();
+  }
+
+  function priceUrl(d) {
+    return `https://www.elprisetjustnu.se/api/v1/prices/${d.getFullYear()}/${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${ZONE}.json`;
+  }
+
+  async function fetchDay(d) {
+    try {
+      const r = await fetch(priceUrl(d), { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      return Array.isArray(j) && j.length ? j : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Morgondagens priser publiceras tidigast kl 13. Innan dess svarar API:et 404
+  // och fönstret slutar vid midnatt.
+  async function loadPrices() {
+    const now = new Date();
+    today = await fetchDay(now);
+    tomorrow = await fetchDay(new Date(Date.now() + 24 * HOUR));
+    if (!today && !tomorrow) {
+      document.getElementById("msg").textContent = "Elpriset kunde inte hämtas";
+      return;
+    }
+    draw();
+  }
+
+  async function loadWeather() {
+    const url = "https://api.open-meteo.com/v1/forecast"
+      + `?latitude=${LAT}&longitude=${LON}`
+      + "&hourly=temperature_2m,apparent_temperature,precipitation_probability,wind_speed_10m,uv_index,weather_code"
+      + "&daily=sunrise,sunset&wind_speed_unit=ms&timezone=Europe%2FStockholm&forecast_days=2";
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      wx = {
+        temp: j.hourly.temperature_2m,
+        feels: j.hourly.apparent_temperature,
+        rain: j.hourly.precipitation_probability,
+        wind: j.hourly.wind_speed_10m,
+        uv:   j.hourly.uv_index,
+        code: j.hourly.weather_code,
+        rise: j.daily.sunrise.map(x => new Date(x)),
+        set:  j.daily.sunset.map(x => new Date(x))
+      };
+      draw();
+    } catch (e) {
+      document.getElementById("msg").textContent = "Vädret kunde inte hämtas";
+    }
+  }
+
+  window.addEventListener("resize", draw);
+  loadPrices();
+  loadWeather();
+  setInterval(draw, MS_DRAW);
+  setInterval(loadPrices, MS_PRICE);
+  setInterval(loadWeather, MS_WX);
+})();
+</script>
+</body>
+</html>
