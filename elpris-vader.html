@@ -29,6 +29,10 @@
   #wx{--wxfs:13px;flex:0 0 auto;display:flex;margin-top:.4vh}
   #wxLab{flex:0 0 auto;text-align:right;color:var(--ink)}
   #wxGrid{flex:1 1 auto;display:grid;text-align:center}
+  #wxSun{flex:0 0 auto;display:flex;flex-direction:column;justify-content:center;
+    gap:.35em;font-size:var(--wxfs)}
+  #wxSun > div{display:flex;align-items:center;gap:.4em}
+  #wxSun svg{flex:0 0 auto}
   #wx div{line-height:1.35;white-space:nowrap}
   #wxGrid > div{color:var(--ink);border-radius:3px}
   .ic{font-size:calc(var(--wxfs) * 1.55);opacity:.8}
@@ -40,7 +44,7 @@
 <body>
   <div id="msg">Hämtar data…</div>
   <div id="chart"></div>
-  <div id="wx"><div id="wxLab"></div><div id="wxGrid"></div></div>
+  <div id="wx"><div id="wxLab"></div><div id="wxGrid"></div><div id="wxSun"></div></div>
 
 <script>
 (() => {
@@ -50,14 +54,31 @@
   const ZONE = "SE3";          // SE1 Luleå · SE2 Sundsvall · SE3 Stockholm · SE4 Malmö
   const LAT  = 59.31;          // Nacka
   const LON  = 18.17;
-  const VAT  = 1;              // sätt 1.25 för att visa pris inkl. moms
-  const SURCHARGE = 0;         // öre/kWh påslag från elhandlaren, t.ex. 8
-  // Färgskalan är absolut, inte relativ till fönstret: allt under PRICE_LOW är
-  // helgrönt, allt över PRICE_HIGH helrött. Jämförs mot priset som visas,
-  // alltså efter VAT och SURCHARGE.
-  const PRICE_LOW  = 0.30;
-  const PRICE_HIGH = 1.20;
-  const WIN_H   = 24;          // fönstrets längd i timmar, från nuvarande kvart
+  // ---- vad en kWh faktiskt kostar --------------------------------------
+  // Alla belopp i öre per kWh EXKLUSIVE moms. Momsen läggs på hela summan
+  // sist, precis som på fakturan. Hämta dina egna värden från elhandels-
+  // respektive elnätsfakturan; noll betyder "räkna inte med posten".
+  const TARIFF = {
+    vat:       1.25,   // moms, 25 % i Sverige
+    energyTax: 36.0,   // energiskatt 2026, 36,0 öre exkl moms (45,0 inkl)
+    markup:     6,     // UPPSKATTNING – elhandlarens påslag, öre/kWh
+    cert:       1,     // UPPSKATTNING – elcertifikat och ursprungsgarantier
+    gridHigh:  35,     // UPPSKATTNING – överföringsavgift höglasttid
+    gridLow:   13      // UPPSKATTNING – överföringsavgift låglasttid
+  };
+  // Höglasttid enligt Nacka Energi: vardagar 06–22 under november–mars.
+  // Har din nätägare ingen tidsdifferentiering, som Vattenfall Eldistribution,
+  // sätter du samma tal på gridHigh och gridLow.
+  // Nätavgifterna är uppräknade från Nacka Energis publicerade 2022-nivåer
+  // (8,1 och 24,2 öre) och bör bytas mot siffrorna på din egen nätfaktura.
+
+  // Färgskalan ankras mot 3-månaderssnittet i stället för fasta belopp. Gult
+  // betyder därmed alltid "normalt pris", oavsett hur stora dina fasta pålägg
+  // är. Faktorerna anger var skalan bottnar och toppar i förhållande till
+  // snittet, och FALLBACK används innan historiken hunnit hämtas.
+  const COLOR = { low: 0.65, high: 1.8, midHue: 55, fallback: 1.40 };
+  const WIN_H   = 24;          // fönstrets längd i timmar, från förra hela timmen
+  const HIST_DAYS = 90;        // hur långt bak de historiska snitten räknas
   const WX_STEP = 2;           // sifferraden visar var WX_STEP:e timme
   // ----------------------------------------------------------------------
 
@@ -66,18 +87,73 @@
   const MS_DRAW  = 30 * 1000;
   const HOUR     = 3600 * 1000;
 
-  let today = null, tomorrow = null, wx = null;
+  let yesterday = null, today = null, tomorrow = null, wx = null, hist = null;
   let padL = 0, padR = 0, padPitch = 0, padFirstX = 0, wxCols = [];
+  let lastW = 0, lastH = 0, pending = false;
+  let errPrice = "", errWx = "";
+
+  // Felen hålls i egna variabler. Tidigare skrev draw() över väderfelet med en
+  // tom sträng så fort priserna kom in, och felet försvann utan spår.
+  const setMsg = () =>
+    document.getElementById("msg").textContent = [errPrice, errWx].filter(Boolean).join(" · ");
 
   const pad2 = n => String(n).padStart(2, "0");
   const hhmm = d => pad2(d.getHours()) + ":" + pad2(d.getMinutes());
-  const kr = v => (v * VAT + SURCHARGE / 100);
+  // Påskdagen enligt Gauss, för att kunna undanta skärtorsdag, långfredag
+  // och annandag påsk från höglasttid.
+  function easter(year) {
+    const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+    const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+    const g = Math.floor((b - f + 1) / 3);
+    const h = (19 * a + b - d - g + 15) % 30;
+    const i = Math.floor(c / 4), k = c % 4;
+    const l = (32 + 2 * e + 2 * i - h - k) % 7;
+    const m = Math.floor((a + 11 * h + 22 * l) / 451);
+    const month = Math.floor((h + l - 7 * m + 114) / 31);
+    const day = ((h + l - 7 * m + 114) % 31) + 1;
+    return new Date(year, month - 1, day);
+  }
+
+  // Dagar som aldrig räknas som vardag i nättariffen.
+  function isRedDay(d) {
+    const m = d.getMonth(), day = d.getDate();
+    if (m === 0 && (day === 1 || day === 6)) return true;              // nyårsdagen, trettondagen
+    if (m === 11 && (day === 24 || day === 25 || day === 26 || day === 31)) return true;
+    const e = easter(d.getFullYear()).getTime(), DAY = 24 * HOUR;
+    const off = Math.round((new Date(d.getFullYear(), m, day).getTime() - e) / DAY);
+    return off === -3 || off === -2 || off === 1;                      // skärtorsdag, långfredag, annandag
+  }
+
+  function isHighLoad(t) {
+    const d = new Date(t);
+    const winter = d.getMonth() >= 10 || d.getMonth() <= 2;            // nov–mars
+    const weekday = d.getDay() >= 1 && d.getDay() <= 5;
+    const daytime = d.getHours() >= 6 && d.getHours() < 22;
+    return winter && weekday && daytime && !isRedDay(d);
+  }
+
+  // Spotpris i SEK/kWh exkl moms in, totalpris i kr/kWh inkl allt ut.
+  const kr = (v, t) => {
+    const grid = isHighLoad(t === undefined ? Date.now() : t) ? TARIFF.gridHigh : TARIFF.gridLow;
+    const ore = v * 100 + TARIFF.markup + TARIFF.cert + TARIFF.energyTax + grid;
+    return ore * TARIFF.vat / 100;
+  };
   const sv = (v, d = 2) => v.toFixed(d).replace(".", ",");
   const midnight = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
 
+  // Referenspris för färgskalan: 3-månaderssnittet om det finns, annars
+  // 30-dagarssnittet, annars fönstrets eget snitt.
+  let colRef = 0;
+
   const col = k => {
-    const f = Math.min(1, Math.max(0, (k - PRICE_LOW) / ((PRICE_HIGH - PRICE_LOW) || 1)));
-    return `hsl(${(142 * (1 - f)).toFixed(0)} 74% 56%)`;
+    const ref = colRef || COLOR.fallback;
+    const lo = ref * COLOR.low, hi = ref * COLOR.high;
+    let h;
+    if (k <= lo) h = 142;
+    else if (k <= ref) h = 142 + (COLOR.midHue - 142) * (k - lo) / ((ref - lo) || 1);
+    else if (k <= hi) h = COLOR.midHue * (1 - (k - ref) / ((hi - ref) || 1));
+    else h = 0;
+    return `hsl(${h.toFixed(0)} 74% 56%)`;
   };
 
   function icon(code, night) {
@@ -121,12 +197,14 @@
     return Math.abs(f - t) >= 1 ? `≈${f}°` : "&nbsp;";
   }
 
-  // Är den absoluta timmen i mörker? Timmar 0–23 hör till idag, 24–47 till imorgon.
-  function isNight(i) {
-    if (!wx || !wx.rise) return false;
-    const d = wx.rise.length > 1 && i >= 24 ? 1 : 0;
-    const t = midnight() + i * HOUR;
-    return t < wx.rise[d].getTime() || t >= wx.set[d].getTime();
+  // Mörker avgörs mot det dygn tidpunkten hör till, jämfört på tidsstämpel.
+  // Indexräkning mot midnatt hade spårat ur vid sommartidsomställningen.
+  function isNight(t) {
+    if (!wx || !wx.rise || !wx.rise.length) return false;
+    let d = 0;
+    for (let i = 0; i < wx.rise.length; i++) if (t >= wx.rise[i].getTime()) d = i;
+    const set = wx.set[d] || wx.set[wx.set.length - 1];
+    return t < wx.rise[d].getTime() || t >= set.getTime();
   }
 
   function alignWeather() {
@@ -134,54 +212,114 @@
     if (!w || !padPitch || !wxCols.length) return;
     const pitch2 = padPitch * WX_STEP;
     const n = wxCols.length;
-    document.getElementById("wxLab").style.width =
-      Math.max(0, padFirstX - pitch2 / 2).toFixed(1) + "px";
-    document.getElementById("wxLab").style.paddingRight = (padPitch * 0.22).toFixed(1) + "px";
+    const pct = v => (Math.max(0, v) / w * 100).toFixed(3) + "%";
+    document.getElementById("wxLab").style.width = pct(padFirstX - pitch2 / 2);
+    document.getElementById("wxLab").style.paddingRight = pct(padPitch * 0.22);
     const grid = document.getElementById("wxGrid");
     grid.style.gridTemplateColumns = `repeat(${n},1fr)`;
-    grid.style.paddingRight =
-      Math.max(0, w - padFirstX - pitch2 * (n - 0.5)).toFixed(1) + "px";
+    grid.style.paddingRight = "0";
+    document.getElementById("wxSun").style.width = pct(w - padFirstX - pitch2 * (n - 0.5));
     const fit = pitch2 * 0.9 / (3 * 0.58);
     document.getElementById("wx").style.setProperty("--wxfs",
       Math.max(7, Math.min(fit, 18)).toFixed(1) + "px");
   }
 
-  // Kvartstexten ska börja vid samma vänsterkant som prissiffran. Prisets bredd
-  // beror på siffran, så kanten mäts fram i stället för att räknas ut.
+  // Klockan och kvartstexten ska börja vid samma vänsterkant som prissiffran.
+  // Prisets bredd beror på siffran, så kanten mäts fram i stället för att räknas ut.
+  // Ramen ritas på uppskattad bredd och justeras sedan mot den faktiska texten,
+  // så den sitter lika tätt oavsett siffra, och möter linjen i mitten.
+  function fitNowLabel(container, xn, fs, W) {
+    try {
+      const tg = container.querySelector("#nowText");
+      const rect = container.querySelector("#nowBox");
+      const line = container.querySelector("#nowLine");
+      const label = container.querySelector("#nowLabel");
+      const bb = tg.getBBox();
+      if (!bb.width) return;
+      const padX = fs * 0.65, padY = fs * 0.32, sw = 1.8;
+      const x = bb.x - padX, w = bb.width + padX * 2;
+      const y = bb.y - padY, h = bb.height + padY * 2;
+      let dx = xn - (x + w / 2);
+      if (x + dx < sw) dx = sw - x;
+      if (x + dx + w > W - sw) dx = W - sw - w - x;
+      const dy = Math.max(0, sw - y);
+      label.setAttribute("transform", `translate(${dx.toFixed(1)},${dy.toFixed(1)})`);
+      rect.setAttribute("x", x.toFixed(1));
+      rect.setAttribute("y", y.toFixed(1));
+      rect.setAttribute("width", w.toFixed(1));
+      rect.setAttribute("height", h.toFixed(1));
+      line.setAttribute("y1", (y + h + dy).toFixed(1));
+    } catch (e) { /* getBBox saknas – behåll den uppskattade ramen */ }
+  }
+
+  // Snittrutorna mäts in mot sin text och skjuts sedan i sidled så att kanten
+  // hamnar mot ritytan. Kopplingsstrecket räknas om efter förskjutningen.
+  function fitAvg(container, fs) {
+    try {
+      const marks = container.querySelectorAll ? container.querySelectorAll(".avgMark") : [];
+      for (const g of marks) {
+        const txt = g.querySelector(".avgText");
+        const rect = g.querySelector(".avgBox");
+        const conn = g.querySelector(".avgConn");
+        const inner = g.querySelector(".avgLabel");
+        const bb = txt.getBBox();
+        if (!bb.width) continue;
+        const padX = fs * 0.55, padY = fs * 0.32;
+        const w = bb.width + padX * 2, h = bb.height + padY * 2;
+        const x0 = bb.x - padX, y0 = bb.y - padY;
+        const side = g.getAttribute("data-side"), edge = +g.getAttribute("data-edge");
+        const dx = side === "left" ? (edge - 7) - (x0 + w) : (edge + 7) - x0;
+        inner.setAttribute("transform", `translate(${dx.toFixed(1)},0)`);
+        rect.setAttribute("x", x0.toFixed(1));
+        rect.setAttribute("y", y0.toFixed(1));
+        rect.setAttribute("width", w.toFixed(1));
+        rect.setAttribute("height", h.toFixed(1));
+        rect.setAttribute("rx", Math.min(h / 2, fs * 0.5).toFixed(1));
+        const bx = x0 + dx;
+        conn.setAttribute("x1", (side === "left" ? bx + w : edge).toFixed(1));
+        conn.setAttribute("x2", (side === "left" ? edge : bx).toFixed(1));
+      }
+    } catch (e) { /* getBBox saknas – behåll de uppskattade rutorna */ }
+  }
+
   function alignSlot(container) {
     try {
-      const price = container.querySelector("#curPrice");
-      const slotEl = container.querySelector("#curSlot");
-      const bb = price.getBBox();
+      const bb = container.querySelector("#curPrice").getBBox();
       if (!bb.width) return;
-      slotEl.setAttribute("x", bb.x.toFixed(1));
-      slotEl.setAttribute("text-anchor", "start");
+      for (const id of ["#curClock", "#curSlot"]) {
+        const el = container.querySelector(id);
+        if (!el) continue;
+        el.setAttribute("x", bb.x.toFixed(1));
+        el.setAttribute("text-anchor", "start");
+      }
     } catch (e) { /* getBBox saknas – behåll centrerat */ }
   }
 
-  function draw() {
-    if (!today) return;
+  function draw(fromResize) {
+    if (!today && !tomorrow && !yesterday) return;
     const box = document.getElementById("chart");
     const W = Math.max(520, Math.round(box.clientWidth || 1000));
     const H = Math.max(180, Math.round(box.clientHeight || 420));
+    if (fromResize && W === lastW && H === lastH) return;
+    lastW = W; lastH = H;
 
     const fs = +(H * 0.042).toFixed(0);
-    const pf = Math.round(fs * 2.5);
+    const pf = Math.round(fs * 2.0);
     const qf = Math.round(fs * 0.95);
     const wBox = Math.max("0,00 kr".length * pf * 0.55, "00:00–00:15".length * qf * 0.55) + fs * 1.2;
     const half = Math.round(wBox / 2) + 14;
-    const L = Math.max(74, Math.round(fs * 4.6), half);
-    const R = Math.max(18, half);
-    const T = Math.round(fs * 5.2);
-    const iconR = Math.max(4, fs * 0.55);
-    const B = Math.round(fs * 3.9);
+    const L = Math.max(74, Math.round(fs * 5.3), half);
+    const R = Math.max(18, Math.round(fs * 5.3), half);
+    const T = Math.round(fs * 5.4);
+    const B = Math.round(fs * 2.1);   // plats åt timsiffrorna
 
-    // Fönstret börjar vid den kvart som pågår nu och sträcker sig WIN_H timmar framåt.
-    const t0 = Math.floor(Date.now() / (15 * 60 * 1000)) * (15 * 60 * 1000);
+    // Fönstret börjar vid förra hela timmen, så den timme som just passerat
+    // syns kvar till nästa hela timme slår. Kl 15:45 börjar det alltså 14:00.
+    const t0 = Math.floor(Date.now() / HOUR) * HOUR - HOUR;
     const t1 = t0 + WIN_H * HOUR;
 
-    const series = (today || []).concat(tomorrow || [])
-      .map(p => ({ t: new Date(p.time_start).getTime(), v: kr(p.SEK_per_kWh), end: new Date(p.time_end).getTime() }))
+    const series = (yesterday || []).concat(today || [], tomorrow || [])
+      .map(p => { const t = new Date(p.time_start).getTime(); return { t, v: kr(p.SEK_per_kWh, t), end: new Date(p.time_end).getTime() }; })
       .filter(p => p.end > t0 && p.t < t1)
       .sort((a, b) => a.t - b.t);
 
@@ -189,21 +327,28 @@
       document.getElementById("msg").textContent = "Inga priser för perioden";
       return;
     }
-    document.getElementById("msg").textContent = "";
+    setMsg();
 
     const v = series.map(p => p.v);
     const lo = Math.min(...v), hi = Math.max(...v);
 
     // Snitt, lägsta och högsta räknas per kalenderdygn på hela dygnets priser,
     // inte på det rullande fönstret.
-    const vals = arr => arr && arr.length ? arr.map(p => kr(p.SEK_per_kWh)) : null;
+    const vals = arr => arr && arr.length
+      ? arr.map(p => kr(p.SEK_per_kWh, new Date(p.time_start).getTime())) : null;
     const dayStat = arr => {
       const a = vals(arr);
       if (!a) return null;
       return { lo: Math.min(...a), hi: Math.max(...a), avg: a.reduce((x, y) => x + y, 0) / a.length };
     };
-    const dToday = dayStat(today), dTom = dayStat(tomorrow);
+    const dToday = dayStat(today);
+    // Morgondagens siffror hör bara hit när morgondagen faktiskt syns i fönstret.
+    const tomVisible = !!tomorrow && midnight() + 24 * HOUR < Math.floor(Date.now() / HOUR) * HOUR - HOUR + WIN_H * HOUR;
+    const dTom = tomVisible ? dayStat(tomorrow) : null;
     const avgToday = dToday ? dToday.avg : null, avgTom = dTom ? dTom.avg : null;
+
+    colRef = (hist && hist.d90) || (hist && hist.d30)
+      || (dToday ? dToday.avg : v.reduce((a, b) => a + b, 0) / v.length);
 
     const spread = [lo, hi]
       .concat(dToday ? [dToday.lo, dToday.hi] : [])
@@ -222,10 +367,10 @@
 
     // Dygnets lägsta och högsta pris: idag till vänster, imorgon till höger.
     if (dToday) for (const k of [dToday.lo, dToday.hi]) {
-      g += `<text x="${L - 10}" y="${(Y(k) + fs * 0.36).toFixed(1)}" fill="rgba(244,244,244,.45)" font-size="${fs}" text-anchor="end">${sv(k)}</text>`;
+      g += `<text x="${L - 10}" y="${(Y(k) + fs * 0.36).toFixed(1)}" fill="rgba(244,244,244,.45)" font-size="${fs}" text-anchor="end">${sv(k)} kr</text>`;
     }
     if (dTom) for (const k of [dTom.lo, dTom.hi]) {
-      g += `<text x="${W - R + 10}" y="${(Y(k) + fs * 0.36).toFixed(1)}" fill="rgba(244,244,244,.45)" font-size="${fs}" text-anchor="start">${sv(k)}</text>`;
+      g += `<text x="${W - R + 10}" y="${(Y(k) + fs * 0.36).toFixed(1)}" fill="rgba(244,244,244,.45)" font-size="${fs}" text-anchor="start">${sv(k)} kr</text>`;
     }
 
     // dygnsskiftet delar fönstret i dagens och morgondagens snitt
@@ -237,18 +382,24 @@
 
     // Ett snitt per kalenderdygn: dagens etikett i vänstermarginalen, morgondagens
     // i högermarginalen, varje linje bara över sin egen del av fönstret.
-    const bh = Math.round(fs * 1.55);
+    // Rutan ritas på uppskattad bredd och mäts sedan in mot texten i fitAvg,
+    // på samma sätt som prisrutan. Radien matchar prisramens.
+    const bh = Math.round(fs * 1.6);
     const avgMark = (val, xa, xb, c, side) => {
       if (val === null || xb - xa < 2) return "";
-      const y = Y(val), lbl = sv(val);
-      const bw = Math.round(lbl.length * fs * 0.58 + fs * 0.7);
-      const bx = side === "left" ? L - 7 - bw : W - R + 7;
-      const cx0 = side === "left" ? bx + bw : W - R;
-      const cx1 = side === "left" ? L : bx;
-      return `<line x1="${xa.toFixed(1)}" y1="${y.toFixed(1)}" x2="${xb.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${c}" stroke-width="1.5" stroke-dasharray="7 6" stroke-opacity=".9"/>`
-        + `<line x1="${cx0.toFixed(1)}" y1="${y.toFixed(1)}" x2="${cx1.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${c}" stroke-width="1.5"/>`
-        + `<rect x="${bx.toFixed(1)}" y="${(y - bh / 2).toFixed(1)}" width="${bw}" height="${bh}" rx="3" fill="#000" stroke="${c}" stroke-width="1.3"/>`
-        + `<text x="${(bx + bw / 2).toFixed(1)}" y="${(y + fs * 0.36).toFixed(1)}" fill="#f4f4f4" font-size="${fs}" text-anchor="middle">${lbl}</text>`;
+      const y = Y(val), lbl = `${sv(val)} kr`;
+      const bw = Math.round(lbl.length * fs * 0.58 + fs * 1.1);
+      const edge = side === "left" ? L : W - R;
+      const bx = side === "left" ? edge - 7 - bw : edge + 7;
+      const cx0 = side === "left" ? bx + bw : edge;
+      const cx1 = side === "left" ? edge : bx;
+      return `<g class="avgMark" data-side="${side}" data-edge="${edge.toFixed(1)}">`
+        + `<line x1="${xa.toFixed(1)}" y1="${y.toFixed(1)}" x2="${xb.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${c}" stroke-width="1.5" stroke-dasharray="7 6" stroke-opacity=".9"/>`
+        + `<line class="avgConn" x1="${cx0.toFixed(1)}" y1="${y.toFixed(1)}" x2="${cx1.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${c}" stroke-width="1.5"/>`
+        + `<g class="avgLabel">`
+        + `<rect class="avgBox" x="${bx.toFixed(1)}" y="${(y - bh / 2).toFixed(1)}" width="${bw}" height="${bh}" rx="${(fs * 0.5).toFixed(1)}" fill="#000" stroke="${c}" stroke-width="1.3"/>`
+        + `<text class="avgText" x="${(bx + bw / 2).toFixed(1)}" y="${(y + fs * 0.36).toFixed(1)}" fill="#f4f4f4" font-size="${fs}" text-anchor="middle">${lbl}</text>`
+        + `</g></g>`;
     };
     g += avgMark(avgToday, L, xMid, "var(--ref)", "left");
     g += avgMark(avgTom, xMid, W - R, "var(--sunset)", "right");
@@ -263,55 +414,73 @@
     const hourTicks = [];
     for (let t = firstHour; t < t1; t += HOUR) hourTicks.push(t);
 
-    const yIcon = H - B + Math.round(fs * 0.85) * 1.15 + iconR * 1.1;
     padL = L; padR = R; padPitch = (W - L - R) / WIN_H;
     wxCols = [];
     for (const t of hourTicks) {
       const d = new Date(t);
       if (d.getHours() % WX_STEP) continue;
       if (!wxCols.length) padFirstX = xOf(t);
-      wxCols.push(Math.round((t - midnight()) / HOUR));
+      wxCols.push(t);
       g += `<text x="${xOf(t).toFixed(1)}" y="${(H - fs * 0.35).toFixed(1)}" fill="rgba(244,244,244,.42)" font-size="${(fs * 1.5).toFixed(0)}" text-anchor="middle">${pad2(d.getHours())}</text>`;
     }
 
-    // sol- och måntecken för de tillfällen som ligger inne i fönstret
-    if (wx && wx.rise) {
-      const tf = Math.round(fs * 0.85);
-      const marks = [];
-      for (let d = 0; d < wx.rise.length; d++) {
-        marks.push([wx.rise[d], "var(--sunrise)", "sun"]);
-        marks.push([wx.set[d], "var(--sunset)", "moon"]);
-      }
-      for (const [d, c, kind] of marks) {
-        const t = d.getTime();
-        if (t < t0 || t > t1) continue;
-        const x = xOf(t);
-        g += `<text x="${x.toFixed(1)}" y="${(H - B + tf * 0.95).toFixed(1)}" fill="${c}" font-size="${tf}" text-anchor="middle" fill-opacity=".8">${hhmm(d)}</text>`;
-        g += kind === "sun" ? sunIcon(x, yIcon, iconR, c) : moonIcon(x, yIcon, iconR, c);
-      }
+
+    // Historiska snitt uppe till höger
+    if (hist) {
+      const hf = Math.round(fs * 1.05);
+      [["30 dagar", hist.d30], ["3 månader", hist.d90]].forEach(([lab, val], i) => {
+        if (val === null) return;
+        const y = T - fs * (2.5 - i * 1.5);
+        g += `<text x="${(W - R).toFixed(1)}" y="${y.toFixed(1)}" font-size="${hf}" text-anchor="end">`
+          + `<tspan fill="rgba(244,244,244,.45)">${lab} </tspan>`
+          + `<tspan fill="#f4f4f4" font-weight="600">${sv(val)} kr</tspan></text>`;
+      });
     }
 
-    // Aktuellt pris centrerat högst upp, utan ram och utan lodrätt streck.
-    const cur = series[0];
+    // Aktuell tid som röd linje, med priset i en röd ram fäst i linjen.
+    const now = Date.now();
+    const cur = series.find(p => p.t <= now && now < p.end) || series[0];
     const slot = `${hhmm(new Date(cur.t))}–${hhmm(new Date(cur.end))}`;
-    const cx = (L + (W - R)) / 2;
-    g += `<text id="curPrice" x="${cx.toFixed(1)}" y="${(T - fs * 2.6).toFixed(1)}" fill="${col(cur.v)}" font-size="${pf}" font-weight="600" text-anchor="middle">${sv(cur.v)}<tspan font-size="${Math.round(pf * 0.42)}" fill-opacity=".75"> kr</tspan></text>`;
-    g += `<text id="curSlot" x="${cx.toFixed(1)}" y="${(T - fs * 0.8).toFixed(1)}" fill="rgba(244,244,244,.5)" font-size="${qf}" text-anchor="middle">${slot}</text>`;
+    const xn = Math.min(Math.max(xOf(now), L), W - R);
+    const cx = Math.min(Math.max(xn, wBox / 2 + 2), W - wBox / 2 - 2);
+    // Radavstånden räknas från teckenkanterna, inte baslinjerna, så luften
+    // mellan klocka–pris och pris–kvart blir lika stor.
+    const gap = fs * 0.25;
+    const yQuarter = T - fs * 0.8;                       // kvartens baslinje
+    const yPrice = yQuarter - qf * 0.71 - gap - pf * 0.22;
+    const yClock = yPrice - pf * 0.72 - gap - qf * 0.19;
+    const boxTop = yClock - qf * 0.71 - fs * 0.2, boxBot = T - fs * 0.45;
+
+    // Linjen och ramen följer prisets färg, så hela markeringen skiftar
+    // grön–gul–röd med nivån i stället för att alltid vara röd.
+    const curCol = col(cur.v);
+    g += `<line id="nowLine" x1="${xn.toFixed(1)}" y1="${boxBot.toFixed(1)}" x2="${xn.toFixed(1)}" y2="${H - B + 8}" stroke="${curCol}" stroke-width="1.8"/>`;
+    g += `<g id="nowLabel">`
+      + `<rect id="nowBox" x="${(cx - wBox / 2).toFixed(1)}" y="${boxTop.toFixed(1)}" width="${wBox.toFixed(1)}" height="${(boxBot - boxTop).toFixed(1)}" rx="${(fs * 0.5).toFixed(1)}" fill="#000" stroke="${curCol}" stroke-width="1.8"/>`
+      + `<g id="nowText">`
+      + `<text id="curClock" x="${cx.toFixed(1)}" y="${yClock.toFixed(1)}" fill="rgba(244,244,244,.5)" font-size="${qf}" text-anchor="middle">${hhmm(new Date(now))}</text>`
+      + `<text id="curPrice" x="${cx.toFixed(1)}" y="${yPrice.toFixed(1)}" fill="${curCol}" font-size="${pf}" font-weight="600" text-anchor="middle">${sv(cur.v)}<tspan font-size="${Math.round(pf * 0.42)}" fill-opacity=".75"> kr</tspan></text>`
+      + `<text id="curSlot" x="${cx.toFixed(1)}" y="${yQuarter.toFixed(1)}" fill="rgba(244,244,244,.5)" font-size="${qf}" text-anchor="middle">${slot}</text>`
+      + `</g></g>`;
 
     box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`;
     alignSlot(box);
+    fitNowLabel(box, xn, fs, W);
+    fitAvg(box, fs);
     drawWeather();
   }
 
   function drawWeather() {
     if (!wx || !wxCols.length) return;
     let html = "";
-    for (const i of wxCols) {
-      if (wx.temp[i] === undefined) { html += "<div></div>"; continue; }
+    const idxOf = t => wx.time ? wx.time.indexOf(t) : -1;
+    for (const t of wxCols) {
+      const i = idxOf(t);
+      if (i < 0 || wx.temp[i] === undefined || wx.temp[i] === null) { html += "<div></div>"; continue; }
       const u = Math.round(wx.uv[i]);
       const c = uvColor(u);
       html += `<div${c ? ` style="color:${c};background:${c}1c"` : ""}>
-        <div class="ic">${icon(wx.code[i], isNight(i))}</div>
+        <div class="ic">${icon(wx.code[i], isNight(t))}</div>
         <div class="tp">${Math.round(wx.temp[i])}°</div>
         <div class="fl">${feelsLabel(i)}</div>
         <div class="sc">${wx.rain[i]}</div>
@@ -327,6 +496,21 @@
        <div class="sc">%</div>
        <div class="sc">m/s</div>
        <div class="sc">UV</div>`;
+    // Nästa soluppgång och solnedgång, i utrymmet till höger om timkolumnerna.
+    if (wx.rise) {
+      const now = Date.now();
+      const next = arr => arr.find(d => d.getTime() > now) || arr[arr.length - 1];
+      const rows = [
+        [next(wx.rise), "var(--sunrise)", "sun"],
+        [next(wx.set), "var(--sunset)", "moon"]
+      ];
+      document.getElementById("wxSun").innerHTML = rows.map(([d, c, kind]) =>
+        `<div style="color:${c}">`
+        + `<svg viewBox="0 0 20 20" width="1.7em" height="1.7em" xmlns="http://www.w3.org/2000/svg">`
+        + (kind === "sun" ? sunIcon(10, 10, 6, c) : moonIcon(10, 10, 6, c))
+        + `</svg><span>${hhmm(d)}</span></div>`).join("");
+    }
+
     alignWeather();
   }
 
@@ -351,10 +535,51 @@
     const now = new Date();
     today = await fetchDay(now);
     tomorrow = await fetchDay(new Date(Date.now() + 24 * HOUR));
-    if (!today && !tomorrow) {
-      document.getElementById("msg").textContent = "Elpriset kunde inte hämtas";
-      return;
+    // Mellan 00:00 och 00:59 börjar fönstret klockan 23 igår, så gårdagens
+    // sista timme behövs för att kurvan inte ska starta en timme in.
+    yesterday = now.getHours() === 0 ? await fetchDay(new Date(Date.now() - 24 * HOUR)) : null;
+    errPrice = (!today && !tomorrow) ? "Elpriset kunde inte hämtas" : "";
+    setMsg();
+    if (errPrice) return;
+    draw();
+  }
+
+  const dayKey = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  // Cachen versioneras på tariffen, så ändrade avgifter inte ger gamla snitt.
+  const tariffTag = Object.values(TARIFF).join("_");
+
+  // Ett dygnssnitt per datum, cachat i localStorage. Historiska dygn ändras
+  // aldrig, så efter första körningen behövs bara det senaste dygnet hämtas.
+  async function dayAvg(d) {
+    const key = `ep:${ZONE}:${tariffTag}:${dayKey(d)}`;
+    try {
+      const c = localStorage.getItem(key);
+      if (c !== null) return +c;
+    } catch (e) { /* localStorage blockerat */ }
+    const j = await fetchDay(d);
+    if (!j || !j.length) return null;
+    // Höglast och låglast skiljer sig inom dygnet, så varje kvart räknas om
+    // för sig innan snittet bildas.
+    const a = j.reduce((x, p) => x + kr(p.SEK_per_kWh, new Date(p.time_start).getTime()), 0) / j.length;
+    try { localStorage.setItem(key, String(a)); } catch (e) {}
+    return a;
+  }
+
+  async function loadHistory() {
+    const days = [];
+    for (let i = 1; i <= HIST_DAYS; i++) days.push(new Date(Date.now() - i * 24 * HOUR));
+
+    const raw = [];
+    for (let i = 0; i < days.length; i += 6) {
+      const chunk = await Promise.all(days.slice(i, i + 6).map(dayAvg));
+      raw.push(...chunk);
     }
+
+    const mean = arr => {
+      const a = arr.filter(x => x !== null && x !== undefined && !isNaN(x));
+      return a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+    };
+    hist = { d30: mean(raw.slice(0, 30)), d90: mean(raw) };
     draw();
   }
 
@@ -374,21 +599,41 @@
         wind: j.hourly.wind_speed_10m,
         uv:   j.hourly.uv_index,
         code: j.hourly.weather_code,
+        time: j.hourly.time.map(x => new Date(x).getTime()),
         rise: j.daily.sunrise.map(x => new Date(x)),
         set:  j.daily.sunset.map(x => new Date(x))
       };
+      errWx = "";
+      setMsg();
       draw();
     } catch (e) {
-      document.getElementById("msg").textContent = "Vädret kunde inte hämtas";
+      errWx = "Vädret kunde inte hämtas";
+      setMsg();
     }
   }
 
-  window.addEventListener("resize", draw);
+  // Layouten sätter sig i flera steg: väderraden och de historiska snitten
+  // tillkommer efter första ritningen och ändrar diagrammets höjd, vilket i sin
+  // tur ändrar fs och därmed sidmarginalerna. En ResizeObserver ritar om när det
+  // händer, och storleksjämförelsen i draw() stoppar kedjan när den stabiliserat sig.
+  const schedule = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; draw(true); });
+  };
+  window.addEventListener("resize", schedule);
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(schedule);
+    ro.observe(document.getElementById("chart"));
+    ro.observe(document.getElementById("wx"));
+  }
   loadPrices();
   loadWeather();
+  loadHistory();
   setInterval(draw, MS_DRAW);
   setInterval(loadPrices, MS_PRICE);
   setInterval(loadWeather, MS_WX);
+  setInterval(loadHistory, 6 * 60 * 60 * 1000);
 })();
 </script>
 </body>
