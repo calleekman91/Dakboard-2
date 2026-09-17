@@ -41,7 +41,7 @@
   #wx div{line-height:1.35;white-space:nowrap}
   #wxGrid > div{color:var(--ink);border-radius:3px}
   .ic{font-size:calc(var(--wxfs) * 1.55);opacity:1;line-height:0}
-  .ic svg{width:1.45em;height:1.57em;display:inline-block;vertical-align:middle}
+  .ic svg{width:0.87em;height:0.94em;display:inline-block;vertical-align:middle}
   .tp{font-size:calc(var(--wxfs) * 1.25);font-weight:600}
   .fl{font-size:calc(var(--wxfs) * 0.95);opacity:.4}
   .sc{font-size:var(--wxfs);opacity:.65}
@@ -105,7 +105,7 @@
   const HOUR     = 3600 * 1000;
 
   let yesterday = null, today = null, tomorrow = null, wx = null, hist = null;
-  let padL = 0, padR = 0, padPitch = 0, padFirstX = 0, wxCols = [];
+  let padL = 0, padR = 0, padPitch = 0, padFirstX = 0, padFs = 13, wxCols = [];
   let focusEnd = 0;
 
   // 1 inne i fokusfönstret, FOCUS.min långt utanför, mjuk övergång emellan.
@@ -303,9 +303,12 @@
     grid.style.gridTemplateColumns = `repeat(${n},1fr)`;
     grid.style.paddingLeft = pct(padFirstX - pitch2 / 2);
     grid.style.paddingRight = pct(w - padFirstX - pitch2 * (n - 0.5));
+    // Textstorleken följer fs som allt annat på skärmen, men kapas av
+    // kolumnbredden när kolumnerna är trängre än så. Tidigare fanns ett fast
+    // tak på 18 px, vilket gjorde att raden slutade växa i stora fönster.
     const fit = pitch2 * 0.9 / (3 * 0.58);
     document.getElementById("wx").style.setProperty("--wxfs",
-      Math.max(7, Math.min(fit, 18)).toFixed(1) + "px");
+      Math.max(6, Math.min(fit, padFs * 1.05)).toFixed(1) + "px");
   }
 
   // Klockan och kvartstexten ska börja vid samma vänsterkant som prissiffran.
@@ -580,7 +583,7 @@
     const hourTicks = [];
     for (let t = firstHour; t < t1; t += HOUR) hourTicks.push(t);
 
-    padL = L; padR = R; padPitch = (W - L - R) / WIN_H;
+    padL = L; padR = R; padPitch = (W - L - R) / WIN_H; padFs = fs;
     wxCols = [];
     // Väderkolumnerna följer WX_STEP, timsiffrorna AXIS_STEP – de behöver inte
     // vara samma. Kolumn varje timme men siffra varannan håller raden tät utan
@@ -824,9 +827,20 @@
   // tur ändrar fs och därmed sidmarginalerna. En ResizeObserver ritar om när det
   // händer, och storleksjämförelsen i draw() stoppar kedjan när den stabiliserat sig.
   const schedule = () => {
+    // Webbläsaren sträcker SVG:n direkt via viewBoxen, medan väderraden läggs
+    // om i nya pixlar. Fram till nästa ritning skalas geometrin därför om i
+    // samma proportion som SVG:n, så kolumnerna aldrig glider ur led under ett
+    // pågående drag.
+    const w = document.getElementById("chart").clientWidth;
+    if (lastW && w && w !== lastW) {
+      const k = w / lastW;
+      padFirstX *= k; padPitch *= k; padL *= k; padR *= k;
+      lastW = w;
+      alignWeather();
+    }
     if (pending) return;
     pending = true;
-    requestAnimationFrame(() => { pending = false; draw(true); });
+    requestAnimationFrame(() => { pending = false; lastW = 0; draw(true); });
   };
   // Går något fel innan första ritningen tänds skärmen ändå, så att
   // felmeddelandet syns i stället för en svart ruta.
