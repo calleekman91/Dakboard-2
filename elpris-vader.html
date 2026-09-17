@@ -115,6 +115,7 @@
     return 1 - f * (1 - FOCUS.min);
   }
   let lastW = 0, lastH = 0, pending = false, revealed = false;
+  let settleW = 0, settleH = 0, settleHits = 0, settleFrames = 0;
   let errPrice = "", errWx = "";
 
   // Felen hålls i egna variabler. Tidigare skrev draw() över väderfelet med en
@@ -682,13 +683,20 @@
     // Första ritningen sker med uppskattade ramar och innan väderraden finns.
     // En extra ritning i nästa bildruta sätter allt på rätt plats, och först
     // därefter tänds skärmen.
+    // Skärmen tänds först när två ritningar i följd fått samma storlek.
+    // Tidigare räckte en extra ritning, men layouten kan sätta sig i flera steg
+    // och då tonades sidan in mitt i ett hopp – två renderingar några pixlar
+    // isär hann visas under intoningen.
     if (!revealed) {
-      revealed = true;
-      requestAnimationFrame(() => {
-        lastW = 0; lastH = 0;
-        draw();
+      if (W === settleW && H === settleH) settleHits++; else settleHits = 0;
+      settleW = W; settleH = H;
+      if (settleHits >= 2 || settleFrames > 12) {
+        revealed = true;
         reveal();
-      });
+      } else {
+        settleFrames++;
+        requestAnimationFrame(() => { lastW = 0; lastH = 0; draw(); });
+      }
     }
   }
 
