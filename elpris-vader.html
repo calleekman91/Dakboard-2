@@ -105,7 +105,7 @@
   const HOUR     = 3600 * 1000;
 
   let yesterday = null, today = null, tomorrow = null, wx = null, hist = null;
-  let padL = 0, padR = 0, padPitch = 0, padFirstX = 0, padFs = 13, wxCols = [];
+  let padL = 0, padR = 0, padPitch = 0, padFirstX = 0, padFs = 13, scaleRefW = 0, wxCols = [];
   let focusEnd = 0;
 
   // 1 inne i fokusfönstret, FOCUS.min långt utanför, mjuk övergång emellan.
@@ -397,7 +397,11 @@
     if (fromResize && W === lastW && H === lastH) return;
     lastW = W; lastH = H;
 
-    const fs = +(H * 0.042).toFixed(0);
+    // fs räknas ur sidans höjd, inte diagrammets mätta höjd. Annars uppstår en
+    // slinga: fs styr väderradens textstorlek, som styr radens höjd, som styr
+    // diagrammets höjd, som styrde fs. Två lägen kunde då pendla mot varandra.
+    const hostH = (document.body && document.body.clientHeight) || H / 0.72;
+    const fs = +(hostH * 0.0302).toFixed(0);
     const pf = Math.round(fs * 1.5);   // prissiffran
     const qf = Math.round(fs * 0.82);  // klocka och kvart
     const wBox = Math.max("0,00 kr".length * pf * 0.55, "00:00–00:15".length * qf * 0.55) + fs * 1.2;
@@ -584,7 +588,7 @@
     const hourTicks = [];
     for (let t = firstHour; t < t1; t += HOUR) hourTicks.push(t);
 
-    padL = L; padR = R; padPitch = (W - L - R) / WIN_H; padFs = fs;
+    padL = L; padR = R; padPitch = (W - L - R) / WIN_H; padFs = fs; scaleRefW = W;
     wxCols = [];
     // Väderkolumnerna följer WX_STEP, timsiffrorna AXIS_STEP – de behöver inte
     // vara samma. Kolumn varje timme men siffra varannan håller raden tät utan
@@ -840,15 +844,15 @@
     // samma proportion som SVG:n, så kolumnerna aldrig glider ur led under ett
     // pågående drag.
     const w = document.getElementById("chart").clientWidth;
-    if (lastW && w && w !== lastW) {
-      const k = w / lastW;
+    if (scaleRefW && w && w !== scaleRefW) {
+      const k = w / scaleRefW;
       padFirstX *= k; padPitch *= k; padL *= k; padR *= k;
-      lastW = w;
+      scaleRefW = w;
       alignWeather();
     }
     if (pending) return;
     pending = true;
-    requestAnimationFrame(() => { pending = false; lastW = 0; draw(true); });
+    requestAnimationFrame(() => { pending = false; draw(true); });
   };
   // Går något fel innan första ritningen tänds skärmen ändå, så att
   // felmeddelandet syns i stället för en svart ruta.
@@ -856,9 +860,10 @@
 
   window.addEventListener("resize", schedule);
   if (window.ResizeObserver) {
+    // Bara diagrammet observeras. Att observera väderraden, vars höjd vi själva
+    // ändrar, stängde slingan.
     const ro = new ResizeObserver(schedule);
     ro.observe(document.getElementById("chart"));
-    ro.observe(document.getElementById("wx"));
   }
   loadPrices();
   loadWeather();
